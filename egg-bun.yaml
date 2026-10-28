@@ -1,0 +1,126 @@
+meta: {version: PLCN_v3}
+name: Bun
+uuid: 984b1593-7c9f-460d-bf57-e900eac2b494
+author: cshubb
+description: Install dependencies and run a Bun app on startup, with optional GitHub pulls. Bun installs automatically.
+tags: [bun]
+features: []
+docker_images:
+  Debian: ghcr.io/pelican-eggs/yolks:debian
+file_denylist: []
+startup_commands:
+  Default: 'exec bash /home/container/.pelican/start.sh'
+config:
+  files: {}
+  startup: {done: '[bun] Launching application'}
+  logs: {}
+  stop: '^C'
+scripts:
+  installation:
+    container: ghcr.io/pelican-eggs/installers:debian
+    entrypoint: bash
+    script: |-
+      #!/bin/bash
+      set -euo pipefail
+      cd /mnt/server
+      rm -rf .pelican
+
+      if [[ -n "${GITHUB_REPO:-}" && ! -d .git ]]; then
+          repo="${GITHUB_REPO#https://github.com/}"
+          [[ "${repo%/}" =~ ^([^/]+/[^/]+)(/tree/(.+))?$ ]]
+          repo="${BASH_REMATCH[1]%.git}" branch="${BASH_REMATCH[3]}"
+          auth=()
+          [[ -z "${GITHUB_TOKEN:-}" ]] || auth=(-c "http.https://github.com/.extraHeader=Authorization: Basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)")
+          echo "Cloning $repo..."
+          git "${auth[@]}" clone ${branch:+--branch "$branch"} "https://github.com/$repo.git" .
+      fi
+
+      mkdir -p .pelican/bin
+      case "$(dpkg --print-architecture)" in
+          arm64) arch=aarch64 ;;
+          *) arch=x64; grep -qw avx2 /proc/cpuinfo || arch=x64-baseline ;;
+      esac
+      echo "Installing Bun (linux-$arch)..."
+      curl -fsSLo .pelican/bun.zip "https://github.com/oven-sh/bun/releases/latest/download/bun-linux-$arch.zip"
+      unzip -joq .pelican/bun.zip -d .pelican/bin
+      rm .pelican/bun.zip
+      ln -s bun .pelican/bin/bunx
+
+      cat > .pelican/start.sh <<'START_SH'
+      #!/bin/bash
+      set -euo pipefail
+      cd /home/container
+      export PATH="$PWD/.pelican/bin:$PATH" GIT_TERMINAL_PROMPT=0
+
+      if [[ "${PULL_ON_STARTUP:-0}" == 1 && -n "${GITHUB_REPO:-}" ]]; then
+          [[ -d .git ]] || { echo '[bun] ERROR: No Git repository; reinstall to clone GITHUB_REPO.' >&2; exit 1; }
+          repo="${GITHUB_REPO#https://github.com/}"
+          [[ "${repo%/}" =~ ^([^/]+/[^/]+)(/tree/(.+))?$ ]]
+          branch="${BASH_REMATCH[3]}"
+          auth=()
+          [[ -z "${GITHUB_TOKEN:-}" ]] || auth=(-c "http.https://github.com/.extraHeader=Authorization: Basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)")
+          echo '[bun] Pulling repository...'
+          git "${auth[@]}" fetch origin
+          [[ -z "$branch" ]] || git switch -q "$branch"
+          git merge --ff-only '@{upstream}'
+      fi
+      unset GITHUB_TOKEN
+
+      export BUN_INSTALL_CACHE_DIR="$PWD/.cache/bun"
+      echo "[bun] Bun $(bun --version)"
+      # --no-save keeps package.json and bun.lock untouched so pulls stay fast-forward.
+      if [[ -f package.json ]]; then
+          echo '[bun] Installing dependencies...'
+          bun install --no-save
+      fi
+      read -ra packages <<< "${BUN_PACKAGES:-}"
+      if (( ${#packages[@]} )); then
+          echo "[bun] Adding ${packages[*]}..."
+          bun add --no-save "${packages[@]}"
+      fi
+      echo '[bun] Launching application'
+      exec bun run "$BUN_FILE"
+      START_SH
+      chmod 755 .pelican/start.sh
+      echo "Bun $(.pelican/bin/bun --version) installed. Dependencies will be installed at startup."
+variables:
+  - sort: 1
+    name: Bun file
+    description: 'File or package.json script passed to bun run, relative to the server root, e.g. index.ts or start.'
+    env_variable: BUN_FILE
+    default_value: index.ts
+    user_viewable: true
+    user_editable: true
+    rules: [required, string, 'max:255']
+  - sort: 2
+    name: Additional packages
+    description: 'Optional space-separated packages installed on startup without saving, e.g. zod@3 dotenv.'
+    env_variable: BUN_PACKAGES
+    default_value: ''
+    user_viewable: true
+    user_editable: true
+    rules: [nullable, string, 'max:1024']
+  - sort: 3
+    name: GitHub repository
+    description: 'Optional owner/repo or GitHub URL; /tree/branch selects a branch. Cloned on install into an empty server.'
+    env_variable: GITHUB_REPO
+    default_value: ''
+    user_viewable: true
+    user_editable: true
+    rules: [nullable, string, 'max:255', 'regex:~^(https://github\.com/)?[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+(/tree/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*)?/?$~']
+  - sort: 4
+    name: GitHub token
+    description: Optional read-only PAT for private repositories. Admin-only field; not isolated from server code.
+    env_variable: GITHUB_TOKEN
+    default_value: ''
+    user_viewable: false
+    user_editable: false
+    rules: [nullable, string, 'max:512']
+  - sort: 5
+    name: Pull on startup
+    description: Fast-forward pull (switching to the URL's branch) before installing dependencies.
+    env_variable: PULL_ON_STARTUP
+    default_value: '0'
+    user_viewable: true
+    user_editable: true
+    rules: [required, boolean]
